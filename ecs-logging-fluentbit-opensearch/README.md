@@ -1,16 +1,28 @@
 # ECS + Fluent Bit + OpenSearch (POC)
 
-- **컴퓨팅**: ECS 클러스터에 **Fargate + EC2** 모두 등록. 앱·Fluent Bit는 Fargate, **OpenSearch는 EC2 용량**으로 배포.
-- **OpenSearch**: ECS 서비스이지만 **launch_type = EC2**, 호스트 볼륨 `/data/opensearch`(EBS)에 데이터 영속.
+- **컴퓨팅**: 앱·Fluent Bit는 **ECS Fargate**, OpenSearch는 **독립 EC2** (ECS 외부 운영).
+- **OpenSearch**: 단일 EC2 인스턴스(t3.medium)에 직접 설치. 고정 ENI(`10.0.10.100`)로 Private IP 고정, EBS 30GB 데이터 영속화.
 
 ## 구성
 
 - **VPC**: `network.tf` — terraform-aws-modules/vpc (public/private, NAT)
 - **ECS**: `ecs.tf` — 클러스터 (Service Connect, ECS Exec)
-- **ECS EC2 용량**: `ecs-ec2-capacity.tf` — ASG(t3.medium, ECS 최적화 AMI), 추가 EBS 30GB → `/data/opensearch` 마운트, capacity provider로 클러스터에 등록
-- **OpenSearch OSS**: `opensearch.tf` — ECS **태스크** (EC2 launch, bridge), `taskdefinitions/opensearch.json.tpl` 사용, 호스트 볼륨으로 `/data/opensearch` → 컨테이너 데이터 경로. 데이터는 EC2 EBS에 저장.
+- **OpenSearch EC2**: `opensearch.tf` — 독립 EC2(t3.medium), 고정 ENI(10.0.10.100), EBS 30GB, user_data로 OpenSearch OSS 2.18.0 설치
+- **설치 스크립트**: `scripts/opensearch_setup.sh.tpl` — EBS 마운트, 커널 파라미터, RPM 설치, systemd 기동
 
-이미지: `opensearchproject/opensearch:2.18.0`. REST 포트 9200, VPC 내부 접근만 허용.
+### OpenSearch EC2 상세
+
+| 항목 | 값 |
+|------|-----|
+| 인스턴스 타입 | t3.medium |
+| AMI | Amazon Linux 2023 (최신, 동적 조회) |
+| Private IP | `10.0.10.100` (고정 ENI, ap-northeast-2a) |
+| 데이터 경로 | `/data/opensearch` (EBS 30GB gp3, 암호화) |
+| OpenSearch 버전 | OSS 2.18.0, single-node, 보안 플러그인 비활성화 |
+| REST 포트 | 9200 |
+| Inbound 허용 | Private Subnet CIDR 4개 (10.0.10~13.0/24) |
+| 접속 방법 | SSM Session Manager (IAM Instance Profile) |
+| (추후) 외부 노출 | ALB → 80/443 → EC2 9200 (SG 주석 해제 필요) |
 
 ## Amazon ECS 의 서비스간 통신 방법
 첫 번째 방법은 Amazon ECS Service Discovery를 활용하는 것 
@@ -31,17 +43,36 @@ terraform plan
 terraform apply
 ```
 
-## OpenSearch (ECS EC2) 확인하기
+## OpenSearch 접속 및 확인
 
-1. `terraform apply` 후 ECS 콘솔에서 **opensearch-oss** 서비스 → 실행 중인 태스크 → 해당 태스크가 올라간 **컨테이너 인스턴스(EC2)** 의 private IP 확인. `http://<그 IP>:9200`으로 접근.
-2. **ECS Exec**으로 컨테이너 접속 후 `curl localhost:9200`:
+### SSM Session Manager로 EC2 접속
 
 ```bash
-aws ecs execute-command --cluster ecs-logging-fluentbit-opensearch --task <TASK_ID> --container opensearch-oss --interactive --command /bin/bash
-# 접속 후
+# 인스턴스 ID 확인 (terraform output)
+terraform output opensearch_instance_id
+
+# SSM으로 접속
+aws ssm start-session --target <INSTANCE_ID>
+
+# 접속 후 OpenSearch 헬스체크
+curl http://localhost:9200/_cluster/health?pretty
 curl http://localhost:9200
 ```
 
-TASK_ID는 ECS 콘솔에서 opensearch-oss 서비스의 실행 중인 태스크에서 복사.
+### VPC 내부에서 직접 접근 (ECS 태스크 등)
 
-**Fluent Bit·앱**: 동일 VPC에서 `http://<컨테이너_인스턴스_private_ip>:9200`으로 로그 전송.
+```bash
+# 고정 IP 사용 (ENI로 고정됨)
+curl http://10.0.10.100:9200/_cluster/health?pretty
+
+# terraform output으로 엔드포인트 확인
+terraform output opensearch_endpoint
+```
+
+### OpenSearch 서비스 상태 확인 (EC2 내부)
+
+```bash
+systemctl status opensearch
+journalctl -u opensearch -f
+cat /var/log/opensearch_setup.log  # user_data 실행 로그
+```
